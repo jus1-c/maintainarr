@@ -1,0 +1,11 @@
+services:
+  qbittorrent-hardlink-maintainer:
+    build: .
+    image: local/qbittorrent-hardlink-maintainer:latest
+    container_name: qbittorrent-hardlink-maintainer
+    restart: unless-stopped
+    volumes:
+      - /mnt/hdd/media-server/data:/data
+      - /mnt/hdd/media-server/services/qbittorrent-hardlink-maintainer:/config
+      - /mnt/hdd/media-server/services/radarr/config.xml:/servarr/radarr-config.xml:ro
+      - /mnt/hdd/media-server/services/sonarr/config.xml:/servarr/sonarr-config.xml:ro

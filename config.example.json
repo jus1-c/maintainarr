@@ -1,0 +1,61 @@
+{
+  "dry_run": true,
+  "run_on_start": true,
+  "run_interval_seconds": 21600,
+  "log_level": "INFO",
+  "data_root": "/data",
+  "download_root": "/data/downloads",
+  "reports_dir": "/config/reports",
+  "repair_duplicate_copies": true,
+  "cleanup_torrents": true,
+  "skip_incomplete_torrents": true,
+  "skip_if_repair_failed": true,
+  "delete_empty_dirs": true,
+  "min_video_size_mb": 10,
+  "partial_hash_bytes": 4194304,
+  "full_hash_before_repair": true,
+  "video_extensions": [
+    ".mkv",
+    ".mp4",
+    ".m4v",
+    ".avi",
+    ".mov",
+    ".wmv",
+    ".mpg",
+    ".mpeg",
+    ".m2ts",
+    ".mts",
+    ".ts",
+    ".webm",
+    ".flv",
+    ".ogm",
+    ".ogv",
+    ".3gp",
+    ".3g2",
+    ".divx",
+    ".asf",
+    ".f4v",
+    ".vob",
+    ".iso"
+  ],
+  "qbittorrent": {
+    "host": "qbittorrent",
+    "port": 8080,
+    "username": "",
+    "password": ""
+  },
+  "radarr": {
+    "enabled": true,
+    "host": "radarr",
+    "port": 7878,
+    "base_url": "",
+    "api_key_file": "/servarr/radarr-config.xml"
+  },
+  "sonarr": {
+    "enabled": true,
+    "host": "sonarr",
+    "port": 8989,
+    "base_url": "",
+    "api_key_file": "/servarr/sonarr-config.xml"
+  }
+}
