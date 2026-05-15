@@ -26,4 +26,28 @@ The interval is configured in `/config/config.json`:
 
 ## First Run
 
+If `/config/config.json` does not exist, the container creates it from the bundled safe defaults.
+
 Keep `dry_run=true` and inspect reports before enabling real repair/cleanup.
+
+## Minimal Compose
+
+```yaml
+services:
+  qbittorrent-hardlink-maintainer:
+    image: local/qbittorrent-hardlink-maintainer:latest
+    build:
+      context: https://github.com/jus1-c/qbittorrent-hardlink-maintainer.git
+      dockerfile: Dockerfile
+    container_name: qbittorrent-hardlink-maintainer
+    restart: unless-stopped
+    volumes:
+      - ${DATA_DIR}:/data
+      - ${SERVICES_DIR}/qbittorrent-hardlink-maintainer:/config
+      - ${SERVICES_DIR}/radarr/config.xml:/servarr/radarr-config.xml:ro
+      - ${SERVICES_DIR}/sonarr/config.xml:/servarr/sonarr-config.xml:ro
+    depends_on:
+      - qbittorrent
+      - radarr
+      - sonarr
+```

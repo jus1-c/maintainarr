@@ -18,6 +18,22 @@ import requests
 DEFAULT_CONFIG_PATH = "/config/config.json"
 
 
+def create_default_config(path: Path) -> None:
+    template_path = Path(__file__).resolve().parents[1] / "config.example.json"
+    if not template_path.exists():
+        raise FileNotFoundError(f"Default config template not found: {template_path}")
+
+    with open(template_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+    print(f"Created default config at {path}", flush=True)
+
+
 @dataclass(frozen=True)
 class FileEntry:
     path: Path
@@ -98,6 +114,10 @@ class QBittorrentClient(ApiClient):
 
 
 def load_config(path: str) -> dict[str, Any]:
+    config_path = Path(path)
+    if not config_path.exists():
+        create_default_config(config_path)
+
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
