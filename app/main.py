@@ -6,6 +6,7 @@ import http.server
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 import urllib.parse
@@ -147,11 +148,17 @@ def load_config(path: str) -> dict[str, Any]:
     if template_path.exists():
         with open(template_path, "r", encoding="utf-8") as f:
             template = json.load(f)
-        added = 0
-        for key, value in template.items():
-            if key not in cfg:
-                cfg[key] = value
-                added += 1
+        def merge_missing(dst: dict[str, Any], src: dict[str, Any]) -> int:
+            added = 0
+            for key, value in src.items():
+                if key not in dst:
+                    dst[key] = value
+                    added += 1
+                elif isinstance(dst[key], dict) and isinstance(value, dict):
+                    added += merge_missing(dst[key], value)
+            return added
+
+        added = merge_missing(cfg, template)
         if added:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -171,6 +178,27 @@ def read_api_key(value: str | None, file_path: str | None) -> str:
         if child.tag == "ApiKey":
             return child.text or ""
     return ""
+
+
+def read_jellyfin_api_key(cfg: dict[str, Any]) -> str:
+    api_key = read_api_key(cfg.get("api_key"), cfg.get("api_key_file"))
+    if api_key:
+        return api_key
+
+    db_path = cfg.get("db_path") or ""
+    if not db_path:
+        return ""
+
+    key_name = cfg.get("api_key_name") or "Maintainarr"
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as con:
+            row = con.execute("select AccessToken from ApiKeys where Name = ? limit 1", (key_name,)).fetchone()
+            if not row:
+                row = con.execute("select AccessToken from ApiKeys order by Id limit 1").fetchone()
+            return (row[0] if row else "") or ""
+    except Exception as exc:
+        logging.warning("Failed to read Jellyfin API key database: %s", exc)
+        return ""
 
 
 def servarr_client(cfg: dict[str, Any]) -> ArrClient:
@@ -842,7 +870,7 @@ def _jellyfin_deleted_task_worker(config_path: str) -> None:
     while True:
         cfg = load_config(config_path)
         jellyfin_cfg = cfg.get("jellyfin") or {}
-        interval = max(10, int(jellyfin_cfg.get("trigger_deleted_task_interval_seconds", 30)))
+        interval = max(10, int(jellyfin_cfg.get("trigger_deleted_task_interval_seconds", 60)))
 
         if not jellyfin_cfg.get("trigger_deleted_task_enabled", False):
             time.sleep(interval)
@@ -850,14 +878,17 @@ def _jellyfin_deleted_task_worker(config_path: str) -> None:
 
         try:
             client = jellyfin_client(jellyfin_cfg)
-            if not task_id:
-                for task in client.get("/ScheduledTasks"):
-                    if task.get("Key") == "WebhookItemDeleted":
-                        task_id = task.get("Id")
-                        break
-            if task_id:
+            task_state = "Idle"
+            for task in client.get("/ScheduledTasks"):
+                if task.get("Key") == "WebhookItemDeleted":
+                    task_id = task.get("Id")
+                    task_state = task.get("State") or "Idle"
+                    break
+            if task_id and task_state == "Idle":
                 client.post_json(f"/ScheduledTasks/Running/{task_id}")
                 logging.debug("Triggered Jellyfin WebhookItemDeleted task")
+            elif task_id:
+                logging.debug("Jellyfin WebhookItemDeleted task is already %s", task_state)
             else:
                 logging.warning("Jellyfin WebhookItemDeleted task not found")
         except Exception as exc:

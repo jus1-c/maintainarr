@@ -78,11 +78,14 @@ Jellyfin's Webhook plugin queues deleted-item notifications and flushes them thr
     "host": "jellyfin",
     "port": 8096,
     "api_key": "YOUR_JELLYFIN_API_KEY",
+    "db_path": "/jellyfin/jellyfin.db",
     "trigger_deleted_task_enabled": true,
-    "trigger_deleted_task_interval_seconds": 30
+    "trigger_deleted_task_interval_seconds": 60
   }
 }
 ```
+
+If `api_key` is empty, maintainarr can read an existing token from `jellyfin.db` when you mount it read-only into the container and set `db_path`. It does not create keys in Jellyfin's database while Jellyfin is running.
 
 When you delete a movie or episode from Jellyfin, the webhook fires. maintainarr uses the Servarr parse API to find matching items and deletes/unmonitors them if `dry_run=false`, or logs the action if `dry_run=true`.
 
@@ -128,6 +131,7 @@ services:
       - ${SERVICES_DIR}/maintainarr:/config
       - ${SERVICES_DIR}/radarr/config.xml:/servarr/radarr-config.xml:ro
       - ${SERVICES_DIR}/sonarr/config.xml:/servarr/sonarr-config.xml:ro
+      - ${SERVICES_DIR}/jellyfin/data/data/jellyfin.db:/jellyfin/jellyfin.db:ro  # optional, for Jellyfin API token lookup
     depends_on:
       - qbittorrent
       - radarr
