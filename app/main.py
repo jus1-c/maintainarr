@@ -798,6 +798,19 @@ class _MaintainarrHandler(http.server.BaseHTTPRequestHandler):
         if sonarr_cfg.get("enabled", True):
             try:
                 sonarr = servarr_client(sonarr_cfg)
+                if payload.get("ItemType") == "Series":
+                    tvdb_id = str(payload.get("Provider_tvdb") or "")
+                    target_title = item_name.casefold()
+                    for series in sonarr.get("/series"):
+                        if (tvdb_id and str(series.get("tvdbId") or "") == tvdb_id) or (series.get("title") or "").casefold() == target_title:
+                            if dry_run:
+                                logging.info("[DRY-RUN] Webhook would delete series: %s", series.get("title", "?"))
+                            else:
+                                sonarr.delete(f"/series/{series['id']}?deleteFiles=true&addImportListExclusion=false")
+                                logging.info("Webhook deleted series: %s", series.get("title", "?"))
+                            break
+                    return
+
                 parsed = sonarr.get("/parse", title=sonarr_title)
                 episodes = parsed.get("episodes") or []
                 series_title = (parsed.get("series") or {}).get("title") or "?"
