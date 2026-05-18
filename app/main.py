@@ -128,6 +128,13 @@ class ArrClient(ApiClient):
         return response
 
 
+class JellyfinClient(ApiClient):
+    def post_json(self, path: str) -> requests.Response:
+        response = self.session.post(f"{self.base_url}{path}", timeout=60)
+        response.raise_for_status()
+        return response
+
+
 def load_config(path: str) -> dict[str, Any]:
     config_path = Path(path)
     if not config_path.exists():
@@ -173,6 +180,18 @@ def servarr_client(cfg: dict[str, Any]) -> ArrClient:
         base_url = f"{base_url}/{base_path}"
     api_key = read_api_key(cfg.get("api_key"), cfg.get("api_key_file"))
     return ArrClient(f"{base_url}/api/v3", api_key)
+
+
+def jellyfin_client(cfg: dict[str, Any]) -> JellyfinClient:
+    base_url = f"http://{cfg.get('host', 'jellyfin')}:{cfg.get('port', 8096)}"
+    base_path = (cfg.get("base_url") or "").strip("/")
+    if base_path:
+        base_url = f"{base_url}/{base_path}"
+    api_key = read_api_key(cfg.get("api_key"), cfg.get("api_key_file"))
+    client = JellyfinClient(base_url, None)
+    if api_key:
+        client.session.headers.update({"X-Emby-Token": api_key})
+    return client
 
 
 def setup_logging(level_name: str) -> None:
@@ -818,6 +837,35 @@ def _periodic_worker(config_path: str) -> None:
         time.sleep(interval)
 
 
+def _jellyfin_deleted_task_worker(config_path: str) -> None:
+    task_id: str | None = None
+    while True:
+        cfg = load_config(config_path)
+        jellyfin_cfg = cfg.get("jellyfin") or {}
+        interval = max(10, int(jellyfin_cfg.get("trigger_deleted_task_interval_seconds", 30)))
+
+        if not jellyfin_cfg.get("trigger_deleted_task_enabled", False):
+            time.sleep(interval)
+            continue
+
+        try:
+            client = jellyfin_client(jellyfin_cfg)
+            if not task_id:
+                for task in client.get("/ScheduledTasks"):
+                    if task.get("Key") == "WebhookItemDeleted":
+                        task_id = task.get("Id")
+                        break
+            if task_id:
+                client.post_json(f"/ScheduledTasks/Running/{task_id}")
+                logging.debug("Triggered Jellyfin WebhookItemDeleted task")
+            else:
+                logging.warning("Jellyfin WebhookItemDeleted task not found")
+        except Exception as exc:
+            logging.warning("Failed to trigger Jellyfin WebhookItemDeleted task: %s", exc)
+
+        time.sleep(interval)
+
+
 def run_once(config_path: str) -> dict[str, Any]:
     cfg = load_config(config_path)
     setup_logging(cfg.get("log_level", "INFO"))
@@ -886,6 +934,7 @@ def main() -> None:
             if http_enabled:
                 _MaintainarrHandler.config_path = args.config
                 threading.Thread(target=_http_worker, args=(cfg, _MaintainarrHandler), daemon=True).start()
+            threading.Thread(target=_jellyfin_deleted_task_worker, args=(args.config,), daemon=True).start()
             threading.Thread(target=_periodic_worker, args=(args.config,), daemon=True).start()
             if not cfg.get("run_on_start", True):
                 first_run = False

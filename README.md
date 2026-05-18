@@ -47,6 +47,7 @@ Keep `dry_run=true` and inspect reports before enabling real repair/cleanup.
 | `unmonitor_on_cleanup` | `false` | Unmonitor Sonarr/Radarr items with no files before deleting torrent |
 | `http_enabled` | `false` | Start an HTTP server for `/run` and `/webhook/jellyfin` |
 | `http_port` | `9898` | Port for the HTTP server |
+| `jellyfin.trigger_deleted_task_enabled` | `false` | Periodically trigger Jellyfin's queued `WebhookItemDeleted` task |
 
 Set `unmonitor_on_cleanup=true` if you delete files from Jellyfin/Sonarr/Radarr UI and want the maintainer to stop re-downloads automatically.
 
@@ -65,11 +66,25 @@ When you delete media in Jellyfin, maintainarr can react immediately instead of 
 2. In Jellyfin, install the **Webhook** plugin from the official catalog.
 
 3. Configure a webhook in Jellyfin:
-   - **Webhook URL**: `http://maintainarr:9898/webhook/jellyfin`
-   - **Notification Type**: Item Removed
-   - Check **Send All Properties**
+    - **Webhook URL**: `http://maintainarr:9898/webhook/jellyfin`
+    - **Notification Type**: Item Deleted
+    - Check **Send All Properties**
 
-When you delete a movie or episode from Jellyfin, the webhook fires. maintainarr uses the Servarr parse API to find matching items and unmonitors them if `dry_run=false`, or logs the action if `dry_run=true`.
+Jellyfin's Webhook plugin queues deleted-item notifications and flushes them through the scheduled task named `Webhook Item Deleted Notifier`. Some Jellyfin versions expose only coarse UI intervals, which can delay deletes. To force that queue to flush quickly, enable:
+
+```json
+{
+  "jellyfin": {
+    "host": "jellyfin",
+    "port": 8096,
+    "api_key": "YOUR_JELLYFIN_API_KEY",
+    "trigger_deleted_task_enabled": true,
+    "trigger_deleted_task_interval_seconds": 30
+  }
+}
+```
+
+When you delete a movie or episode from Jellyfin, the webhook fires. maintainarr uses the Servarr parse API to find matching items and deletes/unmonitors them if `dry_run=false`, or logs the action if `dry_run=true`.
 
 Manual run via HTTP:
 ```bash

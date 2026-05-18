@@ -62,5 +62,15 @@
     "port": 8989,
     "base_url": "",
     "api_key_file": "/servarr/sonarr-config.xml"
+  },
+  "jellyfin": {
+    "enabled": true,
+    "host": "jellyfin",
+    "port": 8096,
+    "base_url": "",
+    "api_key": "",
+    "api_key_file": "",
+    "trigger_deleted_task_enabled": false,
+    "trigger_deleted_task_interval_seconds": 30
   }
 }
