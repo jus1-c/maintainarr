@@ -121,6 +121,13 @@ class QBittorrentClient(ApiClient):
         self.post("/torrents/delete", {"hashes": torrent_hash, "deleteFiles": "false"})
 
 
+class ArrClient(ApiClient):
+    def delete(self, path: str) -> requests.Response:
+        response = self.session.delete(f"{self.base_url}{path}", timeout=60)
+        response.raise_for_status()
+        return response
+
+
 def load_config(path: str) -> dict[str, Any]:
     config_path = Path(path)
     if not config_path.exists():
@@ -159,13 +166,13 @@ def read_api_key(value: str | None, file_path: str | None) -> str:
     return ""
 
 
-def servarr_client(cfg: dict[str, Any]) -> ApiClient:
+def servarr_client(cfg: dict[str, Any]) -> ArrClient:
     base_url = f"http://{cfg.get('host')}:{cfg.get('port')}"
     base_path = (cfg.get("base_url") or "").strip("/")
     if base_path:
         base_url = f"{base_url}/{base_path}"
     api_key = read_api_key(cfg.get("api_key"), cfg.get("api_key_file"))
-    return ApiClient(f"{base_url}/api/v3", api_key)
+    return ArrClient(f"{base_url}/api/v3", api_key)
 
 
 def setup_logging(level_name: str) -> None:
@@ -737,20 +744,30 @@ class _MaintainarrHandler(http.server.BaseHTTPRequestHandler):
                 sonarr = servarr_client(sonarr_cfg)
                 parsed = sonarr.get("/parse", title=item_name)
                 episodes = parsed.get("episodes") or []
+                series_title = (parsed.get("series") or {}).get("title") or "?"
                 for ep in episodes:
                     ep_id = ep.get("id")
                     if not ep_id:
                         continue
                     detail = sonarr.get(f"/episode/{ep_id}")
-                    if not detail.get("monitored"):
-                        continue
                     if dry_run:
                         logging.info("[DRY-RUN] Webhook would unmonitor: %s S%02dE%02d",
-                                     (parsed.get("series") or {}).get("title", "?"), detail.get("seasonNumber") or 0, detail.get("episodeNumber") or 0)
+                                     series_title, detail.get("seasonNumber") or 0, detail.get("episodeNumber") or 0)
                     else:
                         sonarr.put("/episode/monitor", {"episodeIds": [ep_id], "monitored": False})
                         logging.info("Webhook unmonitored: %s S%02dE%02d",
-                                     (parsed.get("series") or {}).get("title", "?"), detail.get("seasonNumber") or 0, detail.get("episodeNumber") or 0)
+                                     series_title, detail.get("seasonNumber") or 0, detail.get("episodeNumber") or 0)
+                    if detail.get("episodeFileId"):
+                        if dry_run:
+                            logging.info("[DRY-RUN] Webhook would delete episode file: %s S%02dE%02d",
+                                         series_title, detail.get("seasonNumber") or 0, detail.get("episodeNumber") or 0)
+                        else:
+                            try:
+                                sonarr.delete(f"/episodefile/{detail['episodeFileId']}")
+                                logging.info("Webhook deleted episode file: %s S%02dE%02d",
+                                             series_title, detail.get("seasonNumber") or 0, detail.get("episodeNumber") or 0)
+                            except Exception as exc:
+                                logging.warning("Failed to delete episode file: %s", exc)
             except Exception:
                 pass
 
@@ -763,12 +780,11 @@ class _MaintainarrHandler(http.server.BaseHTTPRequestHandler):
                 if movie and movie.get("id"):
                     mid = movie["id"]
                     detail = radarr.get(f"/movie/{mid}")
-                    if detail.get("monitored"):
-                        if dry_run:
-                            logging.info("[DRY-RUN] Webhook would unmonitor movie: %s", movie.get("title", "?"))
-                        else:
-                            radarr.put("/movie/monitor", {"movieIds": [mid], "monitored": False})
-                            logging.info("Webhook unmonitored movie: %s", movie.get("title", "?"))
+                    if dry_run:
+                        logging.info("[DRY-RUN] Webhook would delete movie: %s", movie.get("title", "?"))
+                    else:
+                        radarr.delete(f"/movie/{mid}?deleteFiles=true")
+                        logging.info("Webhook deleted movie: %s", movie.get("title", "?"))
             except Exception:
                 pass
 
