@@ -718,7 +718,7 @@ class _MaintainarrHandler(http.server.BaseHTTPRequestHandler):
         item_path = payload.get("Path", "")
         logging.info("Jellyfin webhook: %s %s %s %s", event, item_type, item_name, item_path)
 
-        if event not in ("ItemRemoved", "MediaDeleted"):
+        if event not in ("ItemRemoved", "MediaDeleted", "ItemDeleted"):
             self._json(200, {"status": "ignored", "event": event})
             return
 
