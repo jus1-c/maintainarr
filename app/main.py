@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.server
 import json
 import logging
 import os
+import threading
 import time
+import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -534,13 +537,15 @@ def _unmonitor_radarr(radarr: ApiClient, name: str, dry_run: bool, report: dict[
             logging.warning("Failed to unmonitor movie %s: %s", movie_title, exc)
 
 
-def _cleanup_orphaned_files(cfg: dict[str, Any], report: dict[str, Any], active_paths: set[Path]) -> None:
+def _cleanup_orphaned_files(cfg: dict[str, Any], report: dict[str, Any], active_paths: set[Path], media: list[FileEntry]) -> None:
     if not cfg.get("cleanup_orphaned_files", True):
         return
     dry_run = bool(cfg.get("dry_run", True))
     download_root = Path(cfg.get("download_root", "/data/downloads"))
     extensions = {x.lower() for x in cfg.get("video_extensions", [])}
     min_size = int(cfg.get("min_video_size_mb", 10)) * 1024 * 1024
+    media_inodes: set[tuple[int, int]] = {(m.dev, m.ino) for m in media}
+    active_resolved: set[Path] = {p.resolve() for p in active_paths}
 
     count = 0
     bytes_freed = 0
@@ -550,15 +555,33 @@ def _cleanup_orphaned_files(cfg: dict[str, Any], report: dict[str, Any], active_
         if entry.suffix.lower() not in extensions:
             continue
         try:
-            size = entry.stat().st_size
+            st = entry.stat()
+            size = st.st_size
         except OSError:
             continue
         if size < min_size:
             continue
-        if entry in active_paths:
+        if entry.resolve() in active_resolved:
             continue
+        nlink = st.st_nlink
+        dev = st.st_dev
+        ino = st.st_ino
         count += 1
         bytes_freed += size
+
+        protected = False
+        if nlink > 1:
+            protected = True
+            report["orphaned_hardlinked_protected"] += 1
+            logging.info("[PROTECTED] Orphaned candidate with hardlinks: %s (nlink=%s)", entry, nlink)
+        elif (dev, ino) in media_inodes:
+            protected = True
+            report["orphaned_media_protected"] += 1
+            logging.info("[PROTECTED] Orphaned candidate tracked by Sonarr/Radarr: %s", entry)
+
+        if protected:
+            continue
+
         if dry_run:
             report["orphaned_files_would_delete"] += 1
             logging.info("[DRY-RUN] Would delete orphaned: %s", entry)
@@ -618,6 +641,143 @@ def write_report(cfg: dict[str, Any], report: dict[str, Any]) -> Path:
     return path
 
 
+_run_lock = threading.Lock()
+_last_triggered: float = 0.0
+
+
+class _MaintainarrHandler(http.server.BaseHTTPRequestHandler):
+    """Thin request handler that dispatches to module-level callables."""
+
+    config_path: str = DEFAULT_CONFIG_PATH
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        logging.info(fmt, *args)
+
+    def _json(self, status: int, body: dict[str, Any]) -> None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self) -> None:
+        if self.path == "/healthz":
+            self._json(200, {"status": "ok"})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_POST(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/run":
+            self._trigger_full_run()
+        elif parsed.path == "/webhook/jellyfin":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length) if length else b""
+            self._handle_jellyfin_webhook(body)
+        else:
+            self._json(404, {"error": "not found"})
+
+    def _trigger_full_run(self) -> None:
+        with _run_lock:
+            try:
+                cfg = load_config(self.config_path)
+                report = run_once(self.config_path)
+                self._json(200, {"status": "completed", "report": report})
+            except Exception as exc:
+                logging.exception("Triggered run failed")
+                self._json(500, {"status": "error", "error": str(exc)})
+
+    def _handle_jellyfin_webhook(self, body: bytes) -> None:
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            self._json(400, {"status": "error", "error": "invalid json"})
+            return
+
+        event = payload.get("Event", "")
+        item_type = payload.get("ItemType", "")
+        item_name = payload.get("Name", "")
+        item_path = payload.get("Path", "")
+        logging.info("Jellyfin webhook: %s %s %s %s", event, item_type, item_name, item_path)
+
+        if event not in ("ItemRemoved", "MediaDeleted"):
+            self._json(200, {"status": "ignored", "event": event})
+            return
+
+        self._handle_media_deleted(item_name, item_path, payload)
+        self._json(200, {"status": "processed"})
+
+    def _handle_media_deleted(self, item_name: str, item_path: str, payload: dict[str, Any]) -> None:
+        if not item_name:
+            return
+        cfg = load_config(self.config_path)
+        dry_run = bool(cfg.get("dry_run", True))
+
+        sonarr_cfg = cfg.get("sonarr") or {}
+        if sonarr_cfg.get("enabled", True):
+            try:
+                sonarr = servarr_client(sonarr_cfg)
+                parsed = sonarr.get("/parse", title=item_name)
+                episodes = parsed.get("episodes") or []
+                for ep in episodes:
+                    ep_id = ep.get("id")
+                    if not ep_id:
+                        continue
+                    detail = sonarr.get(f"/episode/{ep_id}")
+                    if not detail.get("monitored"):
+                        continue
+                    if dry_run:
+                        logging.info("[DRY-RUN] Webhook would unmonitor: %s S%02dE%02d",
+                                     (parsed.get("series") or {}).get("title", "?"), detail.get("seasonNumber") or 0, detail.get("episodeNumber") or 0)
+                    else:
+                        sonarr.put("/episode/monitor", {"episodeIds": [ep_id], "monitored": False})
+                        logging.info("Webhook unmonitored: %s S%02dE%02d",
+                                     (parsed.get("series") or {}).get("title", "?"), detail.get("seasonNumber") or 0, detail.get("episodeNumber") or 0)
+            except Exception:
+                pass
+
+        radarr_cfg = cfg.get("radarr") or {}
+        if radarr_cfg.get("enabled", True):
+            try:
+                radarr = servarr_client(radarr_cfg)
+                parsed = radarr.get("/parse", title=item_name)
+                movie = parsed.get("movie")
+                if movie and movie.get("id"):
+                    mid = movie["id"]
+                    detail = radarr.get(f"/movie/{mid}")
+                    if detail.get("monitored"):
+                        if dry_run:
+                            logging.info("[DRY-RUN] Webhook would unmonitor movie: %s", movie.get("title", "?"))
+                        else:
+                            radarr.put("/movie/monitor", {"movieIds": [mid], "monitored": False})
+                            logging.info("Webhook unmonitored movie: %s", movie.get("title", "?"))
+            except Exception:
+                pass
+
+
+def _http_worker(cfg: dict[str, Any], handler_class: type[http.server.BaseHTTPRequestHandler]) -> None:
+    if not cfg.get("http_enabled", False):
+        return
+    port = int(cfg.get("http_port", 9898))
+    server = http.server.HTTPServer(("0.0.0.0", port), handler_class)
+    logging.info("HTTP server listening on port %s", port)
+    server.serve_forever()
+
+
+def _periodic_worker(config_path: str) -> None:
+    while True:
+        interval = int(load_config(config_path).get("run_interval_seconds", 21600))
+        with _run_lock:
+            try:
+                logging.info("Running periodic maintenance")
+                run_once(config_path)
+            except Exception:
+                logging.exception("Periodic run failed")
+        logging.info("Sleeping for %s seconds", interval)
+        time.sleep(interval)
+
+
 def run_once(config_path: str) -> dict[str, Any]:
     cfg = load_config(config_path)
     setup_logging(cfg.get("log_level", "INFO"))
@@ -635,6 +795,8 @@ def run_once(config_path: str) -> dict[str, Any]:
         "orphaned_files_would_delete": 0,
         "orphaned_files_deleted": 0,
         "orphaned_bytes_freed": 0,
+        "orphaned_hardlinked_protected": 0,
+        "orphaned_media_protected": 0,
         "unmonitored_episodes": [],
         "unmonitored_movies": [],
         "unmonitored_applied": 0,
@@ -656,7 +818,7 @@ def run_once(config_path: str) -> dict[str, Any]:
 
     protected_hashes = repair_duplicates(downloads, media, cfg, report)
     cleanup_torrents(qbt, cfg, protected_hashes, report)
-    _cleanup_orphaned_files(cfg, report, active)
+    _cleanup_orphaned_files(cfg, report, active, media)
 
     report["finished_at"] = datetime.now(timezone.utc).isoformat()
     report_path = write_report(cfg, report)
@@ -678,13 +840,24 @@ def main() -> None:
     while True:
         cfg = load_config(args.config)
         setup_logging(cfg.get("log_level", "INFO"))
-        if first_run and not cfg.get("run_on_start", True):
-            logging.info("Initial run disabled; waiting for the first interval")
-        else:
-            try:
+        http_enabled = bool(cfg.get("http_enabled", False))
+
+        if first_run:
+            if http_enabled:
+                _MaintainarrHandler.config_path = args.config
+                threading.Thread(target=_http_worker, args=(cfg, _MaintainarrHandler), daemon=True).start()
+            threading.Thread(target=_periodic_worker, args=(args.config,), daemon=True).start()
+            if not cfg.get("run_on_start", True):
+                first_run = False
+                time.sleep(1)
+                continue
+
+        try:
+            with _run_lock:
+                logging.info("Running periodic maintenance")
                 run_once(args.config)
-            except Exception:
-                logging.exception("Maintainer run failed")
+        except Exception:
+            logging.exception("Maintainer run failed")
         first_run = False
 
         interval = int(load_config(args.config).get("run_interval_seconds", 21600))
