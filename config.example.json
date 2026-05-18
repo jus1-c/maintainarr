@@ -8,6 +8,8 @@
   "reports_dir": "/config/reports",
   "repair_duplicate_copies": true,
   "cleanup_torrents": true,
+  "cleanup_orphaned_files": true,
+  "unmonitor_on_cleanup": false,
   "skip_incomplete_torrents": true,
   "skip_if_repair_failed": true,
   "delete_empty_dirs": true,

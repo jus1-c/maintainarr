@@ -64,6 +64,11 @@ class ApiClient:
         response.raise_for_status()
         return response
 
+    def put(self, path: str, json_data: dict[str, Any]) -> requests.Response:
+        response = self.session.put(f"{self.base_url}{path}", json=json_data, timeout=60)
+        response.raise_for_status()
+        return response
+
 
 class QBittorrentClient(ApiClient):
     def __init__(self, cfg: dict[str, Any]) -> None:
@@ -382,12 +387,12 @@ def remove_empty_parents(path: Path, stop_at: Path) -> None:
         current = current.parent
 
 
-def cleanup_torrents(qbt: QBittorrentClient, cfg: dict[str, Any], protected_hashes: set[str], report: dict[str, Any]) -> None:
+def _collect_candidates(qbt: QBittorrentClient, cfg: dict[str, Any], protected_hashes: set[str], report: dict[str, Any]) -> list[dict[str, Any]]:
     if not cfg.get("cleanup_torrents", True):
-        return
-    dry_run = bool(cfg.get("dry_run", True))
+        return []
     download_root = Path(cfg.get("download_root", "/data/downloads"))
     skip_incomplete = bool(cfg.get("skip_incomplete_torrents", True))
+    candidates: list[dict[str, Any]] = []
 
     for torrent in qbt.torrents():
         torrent_hash = torrent.get("hash")
@@ -400,27 +405,195 @@ def cleanup_torrents(qbt: QBittorrentClient, cfg: dict[str, Any], protected_hash
         if skip_incomplete and float(torrent.get("progress") or 0) < 1.0:
             continue
         files = qbt.torrent_files(torrent_hash)
-        paths = []
+        paths: list[Path] = []
+        file_names: list[str] = []
         has_hardlink = False
         save_path = Path(torrent.get("save_path") or str(download_root))
         for file_info in files:
-            path = save_path / (file_info.get("name") or "")
+            name = file_info.get("name") or ""
+            path = save_path / name
             stat = stat_file(path)
             if not stat:
                 continue
             _, _, _, nlink = stat
             paths.append(path)
+            file_names.append(name)
             if nlink > 1:
                 has_hardlink = True
         if has_hardlink:
             continue
+        candidates.append({"hash": torrent_hash, "name": torrent.get("name"), "paths": paths, "file_names": file_names})
+    return candidates
 
-        report["deleted_torrents"].append({"name": torrent.get("name"), "hash": torrent_hash, "dry_run": dry_run})
+
+def _unmonitor_orphaned_items(candidates: list[dict[str, Any]], cfg: dict[str, Any], report: dict[str, Any]) -> None:
+    if not cfg.get("unmonitor_on_cleanup", False):
+        return
+    dry_run = bool(cfg.get("dry_run", True))
+
+    sonarr_cfg = cfg.get("sonarr") or {}
+    if sonarr_cfg.get("enabled", True):
+        try:
+            sonarr = servarr_client(sonarr_cfg)
+        except Exception:
+            sonarr = None
+    else:
+        sonarr = None
+
+    radarr_cfg = cfg.get("radarr") or {}
+    if radarr_cfg.get("enabled", True):
+        try:
+            radarr = servarr_client(radarr_cfg)
+        except Exception:
+            radarr = None
+    else:
+        radarr = None
+
+    for candidate in candidates:
+        name = candidate.get("name") or ""
+        if sonarr:
+            _unmonitor_sonarr(sonarr, name, dry_run, report)
+        if radarr:
+            _unmonitor_radarr(radarr, name, dry_run, report)
+
+
+def _unmonitor_sonarr(sonarr: ApiClient, name: str, dry_run: bool, report: dict[str, Any]) -> None:
+    try:
+        parsed = sonarr.get("/parse", title=name)
+    except Exception:
+        return
+    episodes = parsed.get("episodes") or []
+    if not episodes:
+        return
+    series_title = (parsed.get("series") or {}).get("title") or "unknown"
+    for ep in episodes:
+        ep_id = ep.get("id")
+        if not ep_id:
+            continue
+        try:
+            detail = sonarr.get(f"/episode/{ep_id}")
+        except Exception:
+            continue
+        if not detail.get("monitored"):
+            continue
+        if detail.get("hasFile"):
+            continue
+        info = {
+            "id": ep_id,
+            "series": series_title,
+            "season": detail.get("seasonNumber"),
+            "episode": detail.get("episodeNumber"),
+            "title": detail.get("title"),
+        }
+        if dry_run:
+            report["unmonitored_episodes"].append(info)
+            report["unmonitored_would_apply"] = True
+            logging.info("[DRY-RUN] Would unmonitor episode: %s S%02dE%02d", series_title, info["season"] or 0, info["episode"] or 0)
+        else:
+            try:
+                sonarr.put("/episode/monitor", {"episodeIds": [ep_id], "monitored": False})
+                report["unmonitored_episodes"].append(info)
+                report["unmonitored_applied"] += 1
+                logging.info("Unmonitored episode: %s S%02dE%02d", series_title, info["season"] or 0, info["episode"] or 0)
+            except Exception as exc:
+                logging.warning("Failed to unmonitor episode %s S%02dE%02d: %s", series_title, info["season"] or 0, info["episode"] or 0, exc)
+
+
+def _unmonitor_radarr(radarr: ApiClient, name: str, dry_run: bool, report: dict[str, Any]) -> None:
+    try:
+        parsed = radarr.get("/parse", title=name)
+    except Exception:
+        return
+    movie = parsed.get("movie")
+    if not movie:
+        return
+    movie_id = movie.get("id")
+    movie_title = movie.get("title") or "unknown"
+    if not movie_id:
+        return
+    try:
+        detail = radarr.get(f"/movie/{movie_id}")
+    except Exception:
+        return
+    if not detail.get("monitored"):
+        return
+    if detail.get("hasFile"):
+        return
+    info = {"id": movie_id, "title": movie_title}
+    if dry_run:
+        report["unmonitored_movies"].append(info)
+        report["unmonitored_would_apply"] = True
+        logging.info("[DRY-RUN] Would unmonitor movie: %s", movie_title)
+    else:
+        try:
+            radarr.put("/movie/monitor", {"movieIds": [movie_id], "monitored": False})
+            report["unmonitored_movies"].append(info)
+            report["unmonitored_applied"] += 1
+            logging.info("Unmonitored movie: %s", movie_title)
+        except Exception as exc:
+            logging.warning("Failed to unmonitor movie %s: %s", movie_title, exc)
+
+
+def _cleanup_orphaned_files(cfg: dict[str, Any], report: dict[str, Any], active_paths: set[Path]) -> None:
+    if not cfg.get("cleanup_orphaned_files", True):
+        return
+    dry_run = bool(cfg.get("dry_run", True))
+    download_root = Path(cfg.get("download_root", "/data/downloads"))
+    extensions = {x.lower() for x in cfg.get("video_extensions", [])}
+    min_size = int(cfg.get("min_video_size_mb", 10)) * 1024 * 1024
+
+    count = 0
+    bytes_freed = 0
+    for entry in download_root.rglob("*"):
+        if not entry.is_file():
+            continue
+        if entry.suffix.lower() not in extensions:
+            continue
+        try:
+            size = entry.stat().st_size
+        except OSError:
+            continue
+        if size < min_size:
+            continue
+        if entry in active_paths:
+            continue
+        count += 1
+        bytes_freed += size
+        if dry_run:
+            report["orphaned_files_would_delete"] += 1
+            logging.info("[DRY-RUN] Would delete orphaned: %s", entry)
+        else:
+            try:
+                entry.unlink()
+                report["orphaned_files_deleted"] += 1
+                logging.info("Deleted orphaned: %s", entry)
+                if cfg.get("delete_empty_dirs", True):
+                    remove_empty_parents(entry, download_root)
+            except OSError as exc:
+                report["errors"].append(str(exc))
+                logging.error("Failed to delete orphaned %s: %s", entry, exc)
+
+    report["orphaned_files_found"] = count
+    report["orphaned_bytes_freed"] = bytes_freed
+
+
+def cleanup_torrents(qbt: QBittorrentClient, cfg: dict[str, Any], protected_hashes: set[str], report: dict[str, Any]) -> None:
+    candidates = _collect_candidates(qbt, cfg, protected_hashes, report)
+    if not candidates:
+        return
+    _unmonitor_orphaned_items(candidates, cfg, report)
+    dry_run = bool(cfg.get("dry_run", True))
+    download_root = Path(cfg.get("download_root", "/data/downloads"))
+
+    for candidate in candidates:
+        torrent_hash = candidate["hash"]
+        torrent_name = candidate["name"]
+        paths = candidate["paths"]
+        report["deleted_torrents"].append({"name": torrent_name, "hash": torrent_hash, "dry_run": dry_run})
         if dry_run:
             report["torrents_would_delete"] += 1
-            logging.info("[DRY-RUN] Would delete torrent with no hardlinks: %s", torrent.get("name"))
+            logging.info("[DRY-RUN] Would delete torrent with no hardlinks: %s", torrent_name)
             continue
-
         report["torrents_deleted"] += 1
         qbt.delete_torrent(torrent_hash)
         for path in paths:
@@ -458,20 +631,32 @@ def run_once(config_path: str) -> dict[str, Any]:
         "protected_torrents": 0,
         "torrents_would_delete": 0,
         "torrents_deleted": 0,
+        "orphaned_files_found": 0,
+        "orphaned_files_would_delete": 0,
+        "orphaned_files_deleted": 0,
+        "orphaned_bytes_freed": 0,
+        "unmonitored_episodes": [],
+        "unmonitored_movies": [],
+        "unmonitored_applied": 0,
+        "unmonitored_would_apply": False,
         "repairs": [],
         "deleted_torrents": [],
         "errors": [],
     }
 
     qbt = QBittorrentClient(cfg.get("qbittorrent") or {})
-    downloads, _ = build_download_entries(qbt, cfg)
+    downloads, torrents_by_hash = build_download_entries(qbt, cfg)
     media = build_media_entries(cfg)
     report["download_files_scanned"] = len(downloads)
     report["media_files_scanned"] = len(media)
 
     logging.info("Scanned %s download files and %s media files", len(downloads), len(media))
+
+    active = {entry.path.resolve().absolute() for entry in downloads}
+
     protected_hashes = repair_duplicates(downloads, media, cfg, report)
     cleanup_torrents(qbt, cfg, protected_hashes, report)
+    _cleanup_orphaned_files(cfg, report, active)
 
     report["finished_at"] = datetime.now(timezone.utc).isoformat()
     report_path = write_report(cfg, report)
