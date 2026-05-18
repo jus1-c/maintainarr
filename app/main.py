@@ -217,7 +217,7 @@ def jellyfin_client(cfg: dict[str, Any]) -> JellyfinClient:
     base_path = (cfg.get("base_url") or "").strip("/")
     if base_path:
         base_url = f"{base_url}/{base_path}"
-    api_key = read_api_key(cfg.get("api_key"), cfg.get("api_key_file"))
+    api_key = read_jellyfin_api_key(cfg)
     client = JellyfinClient(base_url, None)
     if api_key:
         client.session.headers.update({"X-Emby-Token": api_key})
