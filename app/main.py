@@ -127,7 +127,24 @@ def load_config(path: str) -> dict[str, Any]:
         create_default_config(config_path)
 
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        cfg = json.load(f)
+
+    template_path = Path(__file__).resolve().parents[1] / "config.example.json"
+    if template_path.exists():
+        with open(template_path, "r", encoding="utf-8") as f:
+            template = json.load(f)
+        added = 0
+        for key, value in template.items():
+            if key not in cfg:
+                cfg[key] = value
+                added += 1
+        if added:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            print(f"Merged {added} new default keys into {path}", flush=True)
+
+    return cfg
 
 
 def read_api_key(value: str | None, file_path: str | None) -> str:
