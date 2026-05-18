@@ -719,7 +719,7 @@ class _MaintainarrHandler(http.server.BaseHTTPRequestHandler):
             self._json(400, {"status": "error", "error": "invalid json"})
             return
 
-        event = payload.get("Event", "")
+        event = payload.get("Event") or payload.get("NotificationType", "")
         item_type = payload.get("ItemType", "")
         item_name = payload.get("Name", "")
         item_path = payload.get("Path", "")
@@ -738,11 +738,18 @@ class _MaintainarrHandler(http.server.BaseHTTPRequestHandler):
         cfg = load_config(self.config_path)
         dry_run = bool(cfg.get("dry_run", True))
 
+        sonarr_title = item_name
+        if payload.get("ItemType") == "Episode" and payload.get("SeriesName"):
+            season = payload.get("SeasonNumber")
+            episode = payload.get("EpisodeNumber")
+            if season is not None and episode is not None:
+                sonarr_title = f"{payload['SeriesName']} S{int(season):02d}E{int(episode):02d}"
+
         sonarr_cfg = cfg.get("sonarr") or {}
         if sonarr_cfg.get("enabled", True):
             try:
                 sonarr = servarr_client(sonarr_cfg)
-                parsed = sonarr.get("/parse", title=item_name)
+                parsed = sonarr.get("/parse", title=sonarr_title)
                 episodes = parsed.get("episodes") or []
                 series_title = (parsed.get("series") or {}).get("title") or "?"
                 for ep in episodes:
