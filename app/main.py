@@ -186,6 +186,8 @@ def read_jellyfin_api_key(cfg: dict[str, Any]) -> str:
         return api_key
 
     db_path = cfg.get("db_path") or ""
+    if not db_path and Path("/jellyfin/jellyfin.db").exists():
+        db_path = "/jellyfin/jellyfin.db"
     if not db_path:
         return ""
 

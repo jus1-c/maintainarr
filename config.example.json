@@ -71,7 +71,7 @@
     "api_key": "",
     "api_key_file": "",
     "api_key_name": "Maintainarr",
-    "db_path": "",
+    "db_path": "/jellyfin/jellyfin.db",
     "trigger_deleted_task_enabled": false,
     "trigger_deleted_task_interval_seconds": 60
   }
